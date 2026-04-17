@@ -1977,6 +1977,51 @@ def test_reduction_ops(tf_op, relax_op, input_shape, axes, keepdims, dtype):
     verify(ReduceModule, expected)
 
 
+def _make_reduce_bool_expected(relax_op, input_shape, axes, keepdims):
+    if axes is None:
+        axes = list(range(len(input_shape)))
+    bb = relax.BlockBuilder()
+    x = relax.Var("x", relax.TensorStructInfo(input_shape, "bool"))
+    with bb.function("main", [x]):
+        with bb.dataflow():
+            cast_in = bb.emit(relax.op.astype(x, "int8"))
+            reduced = bb.emit(relax_op(cast_in, axis=axes, keepdims=keepdims))
+            gv = bb.emit_output(relax.op.astype(reduced, "bool"))
+        bb.emit_func_output(gv)
+    mod = bb.get()
+    mod["main"] = mod["main"].with_attr("num_input", 1)
+    return mod
+
+
+@pytest.mark.parametrize(
+    "tf_op, relax_op",
+    [
+        (tf.reduce_any, relax.op.max),
+        (tf.reduce_all, relax.op.min),
+    ],
+)
+@pytest.mark.parametrize(
+    "input_shape, axes",
+    [
+        ((1, 8, 8, 3), 1),
+        ((1, 8, 8, 3), [1, 2]),
+        ((1, 8, 8, 3), -1),
+        ((1, 8, 8, 3), None),
+        ((30,), 0),
+        ((2, 5, 2), [0, 2]),
+    ],
+)
+@pytest.mark.parametrize("keepdims", [True, False])
+def test_reduction_bool_ops(tf_op, relax_op, input_shape, axes, keepdims):
+    class ReduceBoolModule(tf.Module):
+        @tf.function(input_signature=[tf.TensorSpec(shape=input_shape, dtype=tf.bool)])
+        def func(self, x):
+            return tf_op(x, axis=axes, keepdims=keepdims)
+
+    expected = _make_reduce_bool_expected(relax_op, input_shape, axes, keepdims)
+    verify(ReduceBoolModule, expected)
+
+
 def test_pad():
     class Pad(tf.Module):
         @tf.function(input_signature=[tf.TensorSpec(shape=(2, 3), dtype=tf.float32)])
