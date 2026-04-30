@@ -266,5 +266,77 @@ def test_rvv_asm_instruction_reduction():
     )
 
 
+# ---------------------------------------------------------------------------
+# Test: RVV tensorized reduction (vfredmax.vs / vfredusum.vs)
+# ---------------------------------------------------------------------------
+
+
+def test_rvv_reduction_tensorizes_softmax():
+    """On RVV targets, the schedule should emit vfredmax.vs and vfredusum.vs
+    instructions for the softmax max/expsum reduction blocks instead of a
+    plain unrolled scalar accumulator loop.
+    """
+    target = _rvv_target()
+    mod = _build_softmax(14, 185, fast=True)
+    with target:
+        mod_sched = dl.ApplyDefaultSchedule(Reduction())(mod)
+    asm = _codegen_asm(mod_sched, target)
+
+    # vfredmax.vs is emitted for the max reduction (softmax(maxelem)).
+    assert "vfredmax.vs" in asm or "vfredumax.vs" in asm, (
+        "Expected vfredmax(.vs) in scheduled RVV softmax assembly"
+    )
+    # vfredusum.vs is emitted for the expsum reduction.
+    assert "vfredusum.vs" in asm or "vfredsum.vs" in asm, (
+        "Expected vfredusum(.vs) in scheduled RVV softmax assembly"
+    )
+
+
+def test_rvv_reduction_no_regression_on_scalar_target():
+    """Plain LLVM CPU target must keep the existing split+unroll path; the
+    RVV tensorize path should be inert when target lacks `v` extension.
+    """
+    target = _llvm_target()
+    mod = _build_softmax(14, 185, fast=False)
+    sch = _apply_and_check(mod, target)
+    script = str(sch.mod)
+    # No RVV intrinsic names should leak into a non-RVV schedule.
+    assert "rvv_reduce" not in script, (
+        "RVV reduction intrinsic must not be tensorized for plain LLVM target"
+    )
+
+
+@pytest.mark.parametrize("fast", [False, True], ids=["softmax", "fast_softmax"])
+def test_rvv_reduction_correctness(fast):
+    """Bit-tolerant correctness on a runnable RVV-disabled host: use the
+    plain LLVM target so we can execute the schedule and verify the
+    tensorize-or-fallback codepath does not corrupt outputs.
+
+    Note: this exercises the schedule pipeline on the host; the RVV
+    intrinsic emission is asserted in `test_rvv_reduction_tensorizes_softmax`
+    which only runs codegen, not execution.
+    """
+    import numpy as np
+
+    target = _llvm_target()
+    batch, features = 4, 64
+    mod = _build_softmax(batch, features, fast=fast)
+    with target:
+        mod_sched = dl.ApplyDefaultSchedule(Reduction())(mod)
+
+    rt_mod = tvm.compile(mod_sched, target=target)
+    dev = tvm.cpu()
+    a_np = np.random.randn(batch, features).astype("float32")
+    b_np = np.empty_like(a_np)
+    a = tvm.runtime.tensor(a_np, dev)
+    b = tvm.runtime.tensor(b_np, dev)
+    rt_mod["main"](a, b)
+
+    # Reference: standard softmax along axis=1.
+    x = a_np - a_np.max(axis=1, keepdims=True)
+    ref = np.exp(x) / np.exp(x).sum(axis=1, keepdims=True)
+    np.testing.assert_allclose(b.numpy(), ref, rtol=2e-2, atol=2e-2)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
