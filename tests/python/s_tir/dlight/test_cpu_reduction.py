@@ -275,20 +275,26 @@ def test_rvv_reduction_tensorizes_softmax():
     """On RVV targets, the schedule should emit vfredmax.vs and vfredusum.vs
     instructions for the softmax max/expsum reduction blocks instead of a
     plain unrolled scalar accumulator loop.
+
+    Uses a shape whose feature dimension is a multiple of the LMUL=1 chunk
+    size for fp32 (VLEN=128 → 4 elements). Shapes that do not divide
+    cleanly produce a `T.where` predicate that prevents tensorize from
+    matching the chunk; those fall back to the existing split+unroll
+    annotation path (covered by ``test_rvv_asm_instruction_reduction``).
     """
     target = _rvv_target()
-    mod = _build_softmax(14, 185, fast=True)
+    mod = _build_softmax(4, 256, fast=True)
     with target:
         mod_sched = dl.ApplyDefaultSchedule(Reduction())(mod)
     asm = _codegen_asm(mod_sched, target)
 
     # vfredmax.vs is emitted for the max reduction (softmax(maxelem)).
-    assert "vfredmax.vs" in asm or "vfredumax.vs" in asm, (
-        "Expected vfredmax(.vs) in scheduled RVV softmax assembly"
+    assert "vfredmax.vs" in asm, (
+        "Expected vfredmax.vs in scheduled RVV softmax assembly"
     )
     # vfredusum.vs is emitted for the expsum reduction.
-    assert "vfredusum.vs" in asm or "vfredsum.vs" in asm, (
-        "Expected vfredusum(.vs) in scheduled RVV softmax assembly"
+    assert "vfredusum.vs" in asm, (
+        "Expected vfredusum.vs in scheduled RVV softmax assembly"
     )
 
 

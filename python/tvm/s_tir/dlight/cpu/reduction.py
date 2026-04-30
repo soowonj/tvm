@@ -20,8 +20,7 @@ import logging
 
 from tvm import DataType, s_tir, tirx
 from tvm.target import Target
-from tvm.target.codegen import llvm_get_vector_width
-from tvm.target.codegen import target_has_features
+from tvm.target.codegen import llvm_get_vector_width, target_has_features
 
 from ..analysis import normalize_prim_func
 from ..base import get_extent
@@ -49,6 +48,9 @@ def _detect_reduction_op(sch: "s_tir.Schedule", block_rv) -> str | None:
     block_stmt = sch.get(block_rv)
     found = {"op": None}
 
+    def _is_self_load(operand, buf):
+        return isinstance(operand, tirx.BufferLoad) and operand.buffer.same_as(buf)
+
     def _visit(stmt):
         if found["op"] is not None:
             return
@@ -58,21 +60,33 @@ def _detect_reduction_op(sch: "s_tir.Schedule", block_rv) -> str | None:
         # Strip an outer Cast if present.
         if isinstance(value, tirx.Cast):
             value = value.value
-        # tir.max(...) call
+        same_buf = stmt.buffer
+        # T.max(self, ...) / T.min(self, ...) lower to tirx.Max/tirx.Min binops
+        # rather than generic Call nodes. Check both forms.
+        if isinstance(value, tirx.Max):
+            if _is_self_load(value.a, same_buf) or _is_self_load(value.b, same_buf):
+                found["op"] = "max"
+            return
+        if isinstance(value, tirx.Min):
+            # vfredmin would handle this; not enabled yet.
+            if _is_self_load(value.a, same_buf) or _is_self_load(value.b, same_buf):
+                found["op"] = "min"
+            return
+        # Defensive: also accept the Call form in case some frontend emits it.
         if isinstance(value, tirx.Call):
             op_name = getattr(value.op, "name", "")
-            if op_name in ("tir.max",):
+            if op_name == "tir.max":
                 found["op"] = "max"
-            elif op_name in ("tir.min",):
-                # vfredmin would handle this; not enabled yet.
+                return
+            if op_name == "tir.min":
                 found["op"] = "min"
+                return
         # Add(load(C), load(A)) or Add(load(A), load(C)) — sum accumulator
-        elif isinstance(value, tirx.Add):
-            same_buf = stmt.buffer
+        if isinstance(value, tirx.Add):
             for operand in (value.a, value.b):
-                if isinstance(operand, tirx.BufferLoad) and operand.buffer.same_as(same_buf):
+                if _is_self_load(operand, same_buf):
                     found["op"] = "sum"
-                    break
+                    return
 
     tirx.stmt_functor.post_order_visit(block_stmt, _visit)
     return found["op"]
@@ -228,8 +242,9 @@ class Reduction(CPUScheduleRule):
             # Whole reduction fits in one vector; nothing to chunk.
             return
 
-        _, vec_loop = sch.split(inner, factors=[None, vec_lanes])
+        outer, vec_loop = sch.split(inner, factors=[None, vec_lanes])
 
+        # Resolve a registered RVV reduction intrinsic for this block (read-only).
         intrin_name = (
             Reduction._resolve_rvv_reduction_intrin(
                 sch, block_rv, vec_lanes, dtype_bits, target
@@ -240,6 +255,12 @@ class Reduction(CPUScheduleRule):
 
         if intrin_name is not None:
             try:
+                # Peel off the init clause as a separate block so the update
+                # block matches the update-only desc registered for the
+                # intrinsic.  decompose_reduction at the chunk-outer loop
+                # places the init just inside the spatial loop, so it runs
+                # once per batch element.
+                sch.decompose_reduction(block_rv, outer)
                 sch.tensorize(vec_loop, intrin_name)
                 return
             except Exception as exc:  # pylint: disable=broad-except
