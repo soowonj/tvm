@@ -209,9 +209,16 @@ def rvv_reduce_kernels(n_elems: int, dtype: str, op: str):
         )
 
     intrin_name = "llvm.riscv.vfredmax" if op == "max" else "llvm.riscv.vfredusum"
-    # FP rounding mode argument — matches existing usage in the dot-product kernel.
-    mask_args = (T.uint64(7),)
+    # vfredusum.vs takes a rounding-mode immediate (FRM) argument before VL,
+    # mirroring the existing dot-product kernel.  vfredmax.vs does not — its
+    # LLVM intrinsic signature is (passthru, vec_in, init_vec, vl).
+    needs_frm = op == "sum"
+    frm_args = (T.uint64(7),) if needs_frm else ()
 
+    # The desc is in update-only form (no T.init() clause).  Callers must
+    # apply ``sch.decompose_reduction`` to peel off the init before invoking
+    # tensorize, mirroring the convention used by the existing matmul
+    # tensor_intrins (see tests/python/s_tir/schedule/test_tir_schedule_tensorize.py).
     if op == "max":
 
         @T.prim_func
@@ -220,7 +227,7 @@ def rvv_reduce_kernels(n_elems: int, dtype: str, op: str):
             C: T.Buffer((1,), dtype, offset_factor=1),
         ) -> None:
             with T.sblock("root"):
-                T.reads(A[0:n_elems], C[0])
+                T.reads(C[0], A[0:n_elems])
                 T.writes(C[0])
                 for k in T.serial(0, n_elems):
                     with T.sblock("update"):
@@ -235,14 +242,19 @@ def rvv_reduce_kernels(n_elems: int, dtype: str, op: str):
             C: T.Buffer((1,), dtype, offset_factor=1),
         ) -> None:
             with T.sblock("root"):
-                T.reads(A[0:n_elems], C[0])
+                T.reads(C[0], A[0:n_elems])
                 T.writes(C[0])
                 for k in T.serial(0, n_elems):
                     with T.sblock("update"):
                         vk = T.axis.reduce(n_elems, k)
                         C[0] = C[0] + A[vk]
 
-    n_lanes = n_elems  # LMUL=1 lane count
+    # LLVM scalable-vector parameter for RVV at LMUL=1: <vscale x (ELEN/SEW) x dtype>.
+    # ELEN is fixed to 64 in the LLVM RISC-V backend; vscale absorbs the
+    # variation in VLEN at runtime.  For fp32 this is <vscale x 2 x f32>; at
+    # VLEN=128 vscale=2 → 4 lanes (= n_elems).
+    elen_lanes = 64 // DataType(dtype).bits
+    vec_dtype = f"{dtype}xvscalex{elen_lanes}"
 
     # fmt: off
     @T.prim_func
@@ -255,30 +267,29 @@ def rvv_reduce_kernels(n_elems: int, dtype: str, op: str):
             T.writes(C[0])
 
             vec_a = T.call_llvm_intrin(
-                f"{dtype}xvscalex{n_lanes}",
+                vec_dtype,
                 "llvm.riscv.vle",
-                T.broadcast(T.Cast(dtype, 0), T.vscale() * n_lanes),
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * elen_lanes),
                 T.tvm_access_ptr(T.type_annotation(dtype), A.data, 0, n_elems, 1),
                 T.int64(n_elems))
 
-            # Load current accumulator C[0] into a vector with the value in lane 0.
-            # vle reads `1` element here, leaving other lanes as the broadcast zero;
-            # vfredmax/vfredusum semantics use lane 0 of the second source as the
-            # initial scalar accumulator.
+            # Load C[0] into lane 0 of an LMUL=1 vector for use as the initial
+            # accumulator scalar.  vfredmax/vfredusum take lane 0 of the third
+            # source as the seed and reduce it together with the input vector.
             ini_acc = T.call_llvm_intrin(
-                f"{dtype}xvscalex{n_lanes}",
+                vec_dtype,
                 "llvm.riscv.vle",
-                T.broadcast(T.Cast(dtype, 0), T.vscale() * n_lanes),
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * elen_lanes),
                 T.tvm_access_ptr(T.type_annotation(dtype), C.data, 0, 1, 1),
                 T.int64(1))
 
             red = T.call_llvm_intrin(
-                f"{dtype}xvscalex{n_lanes}",
+                vec_dtype,
                 intrin_name,
-                T.broadcast(T.Cast(dtype, 0), T.vscale() * n_lanes),
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * elen_lanes),
                 vec_a,
                 ini_acc,
-                *mask_args,
+                *frm_args,
                 T.uint64(n_elems))
 
             C[0] = T.call_llvm_intrin(
