@@ -171,6 +171,130 @@ def rvv_vec_dot_product_kernels(
     return rvv_vec_dot_prod_desc, rvv_vec_dot_prod_impl
 
 
+def rvv_reduce_kernels(n_elems: int, dtype: str, op: str):
+    """1-D vector reduction kernels for RVV.
+
+    Reduces ``A[n_elems]`` of ``dtype`` into a scalar accumulator ``C[0]``
+    using a single RVV reduction instruction (``vfredmax.vs``/``vfredusum.vs``).
+
+    These kernels exist so that DLight CPU schedule rules (e.g. softmax) can
+    ``tensorize`` the inner reduction chunk of size ``n_elems`` instead of
+    relying on LLVM auto-vectorization, which produces suboptimal code on
+    scalable-vector targets (see apache/tvm#18569).
+
+    Args:
+        n_elems (int): chunk size, equal to ``VLEN / SEW`` for the natural
+            LMUL=1 case.
+        dtype (str): element dtype. Currently restricted to floating point —
+            ``vfredmax``/``vfredusum`` operate on FP vectors.
+        op (str): ``"max"`` for ``vfredmax.vs`` or ``"sum"`` for
+            ``vfredusum.vs`` (unordered, faster than ``vfredosum``).
+
+    Returns:
+        Tuple of (desc, impl) ``T.prim_func``s suitable for
+        ``TensorIntrin.register``.
+
+    Notes on numeric semantics:
+        * ``vfredusum`` is *unordered* — partial-reduction order is hardware
+          dependent. Result may differ from a strict left-to-right scalar sum
+          in the lowest few mantissa bits. softmax/layernorm tolerate this.
+        * If a strict sum order is required, swap to ``vfredosum`` (ordered)
+          at the cost of throughput.
+    """
+    if op not in ("max", "sum"):
+        raise ValueError(f"unsupported reduction op: {op}")
+    if not dtype.startswith("float"):
+        raise ValueError(
+            f"rvv_reduce_kernels currently only supports floating-point dtypes, got {dtype}"
+        )
+
+    intrin_name = "llvm.riscv.vfredmax" if op == "max" else "llvm.riscv.vfredusum"
+    # FP rounding mode argument — matches existing usage in the dot-product kernel.
+    mask_args = (T.uint64(7),)
+
+    if op == "max":
+
+        @T.prim_func
+        def rvv_reduce_desc(
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((1,), dtype, offset_factor=1),
+        ) -> None:
+            with T.sblock("root"):
+                T.reads(A[0:n_elems], C[0])
+                T.writes(C[0])
+                for k in T.serial(0, n_elems):
+                    with T.sblock("update"):
+                        vk = T.axis.reduce(n_elems, k)
+                        C[0] = T.max(C[0], A[vk])
+
+    else:
+
+        @T.prim_func
+        def rvv_reduce_desc(
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((1,), dtype, offset_factor=1),
+        ) -> None:
+            with T.sblock("root"):
+                T.reads(A[0:n_elems], C[0])
+                T.writes(C[0])
+                for k in T.serial(0, n_elems):
+                    with T.sblock("update"):
+                        vk = T.axis.reduce(n_elems, k)
+                        C[0] = C[0] + A[vk]
+
+    n_lanes = n_elems  # LMUL=1 lane count
+
+    # fmt: off
+    @T.prim_func
+    def rvv_reduce_impl(
+        A: T.Buffer((n_elems,), dtype, offset_factor=1),
+        C: T.Buffer((1,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems], C[0])
+            T.writes(C[0])
+
+            vec_a = T.call_llvm_intrin(
+                f"{dtype}xvscalex{n_lanes}",
+                "llvm.riscv.vle",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * n_lanes),
+                T.tvm_access_ptr(T.type_annotation(dtype), A.data, 0, n_elems, 1),
+                T.int64(n_elems))
+
+            # Load current accumulator C[0] into a vector with the value in lane 0.
+            # vle reads `1` element here, leaving other lanes as the broadcast zero;
+            # vfredmax/vfredusum semantics use lane 0 of the second source as the
+            # initial scalar accumulator.
+            ini_acc = T.call_llvm_intrin(
+                f"{dtype}xvscalex{n_lanes}",
+                "llvm.riscv.vle",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * n_lanes),
+                T.tvm_access_ptr(T.type_annotation(dtype), C.data, 0, 1, 1),
+                T.int64(1))
+
+            red = T.call_llvm_intrin(
+                f"{dtype}xvscalex{n_lanes}",
+                intrin_name,
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * n_lanes),
+                vec_a,
+                ini_acc,
+                *mask_args,
+                T.uint64(n_elems))
+
+            C[0] = T.call_llvm_intrin(
+                dtype,
+                "llvm.riscv.vfmv.f.s",
+                red)
+    # fmt: on
+    return rvv_reduce_desc, rvv_reduce_impl
+
+
+def _rvv_reduce_kernel_name(n_elems: int, dtype: str, op: str) -> str:
+    """Stable name for a registered reduction intrinsic."""
+    dt = DataType(dtype)
+    return f"rvv_reduce_{op}_{n_elems}{dt[0]}{dt.bits}"
+
+
 @tvm_ffi.register_global_func("tirx.tensor_intrin.register_rvv_isa_intrinsics")
 def register_rvv_isa_intrinsics(target: Target, inventory_only=False) -> dict():
     """Register RISCV V (vector) intrinsics
@@ -225,6 +349,21 @@ def register_rvv_isa_intrinsics(target: Target, inventory_only=False) -> dict():
                 TensorIntrin.register(kernel_name, desc, impl, override=True)
 
             n_elems //= 2
+
+    # 1-D reduction kernels (max, sum) — used by DLight CPU softmax-like rule
+    # to tensorize the inner reduction chunk into vfredmax.vs/vfredusum.vs.
+    reduce_dtypes = ["float32", "float16"]
+    for r_dtype in reduce_dtypes:
+        chunk = vlen // DataType(r_dtype).bits
+        if chunk < 2:
+            continue
+        for r_op in ("max", "sum"):
+            kernel_name = _rvv_reduce_kernel_name(chunk, r_dtype, r_op)
+            kernels_inventory[kernel_name] = chunk
+            if not inventory_only:
+                logger.debug(f"Registering kernel {kernel_name}")
+                desc, impl = rvv_reduce_kernels(chunk, r_dtype, r_op)
+                TensorIntrin.register(kernel_name, desc, impl, override=True)
 
     return kernels_inventory
 
