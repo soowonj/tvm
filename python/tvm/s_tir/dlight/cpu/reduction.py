@@ -179,15 +179,10 @@ class Reduction(CPUScheduleRule):
         for block_info in block_infos[:-1]:
             if block_info.is_injective():
                 self._vectorize_inner(sch, block_info.block_rv, vec_lanes)
-                continue
-            # Try RVV-tensorized reduction first; fall back to split+unroll.
-            tensorized = False
-            if rvv_ok:
-                tensorized = self._tensorize_rvv_reduction(
-                    sch, block_info.block_rv, vec_lanes, dtype_bits, target
+            else:
+                self._schedule_reduction_inner(
+                    sch, block_info.block_rv, vec_lanes, dtype_bits, target, rvv_ok
                 )
-            if not tensorized:
-                self._unroll_reduction_inner(sch, block_info.block_rv, vec_lanes)
 
         return sch
 
@@ -210,78 +205,90 @@ class Reduction(CPUScheduleRule):
             sch.vectorize(vec_loop)
 
     @staticmethod
-    def _tensorize_rvv_reduction(sch, block_rv, vec_lanes, dtype_bits, target):
-        """Tensorize a reduction block's inner loop with an RVV reduction intrinsic.
+    def _schedule_reduction_inner(sch, block_rv, vec_lanes, dtype_bits, target, rvv_ok):
+        """Schedule a reduction block's inner axis.
 
-        Returns True on success. Returns False (without modifying the schedule)
-        if the block's reduction op cannot be mapped, the chunk size is too
-        small, or the matching intrinsic is unavailable.
+        Splits the inner axis once into ``[outer, vec_lanes-chunk]`` and then:
+          * If an RVV reduction intrinsic is registered and matches this
+            block's reduction op + dtype, ``tensorize`` the chunk.
+          * Otherwise (or if tensorize raises), fall back to the existing
+            ``pragma_auto_unroll_max_step`` annotation that prevents
+            harmful LLVM full-unroll on RVV targets.
+
+        Doing the split unconditionally keeps the schedule transactional —
+        the chunk loop is always a valid loop to either tensorize or
+        annotate, even if intrinsic resolution fails partway through.
         """
-        op = _detect_reduction_op(sch, block_rv)
-        if op not in ("max", "sum"):
-            return False
-
-        block_loops = sch.get_loops(block_rv)
-        if len(block_loops) <= 1:
-            return False
-
-        inner = block_loops[-1]
-        extent = get_extent(sch, inner)
-        # Chunk must be >= vec_lanes for tensorize to be meaningful;
-        # vfred*.vs needs at least one vector worth of input.
-        if isinstance(extent, int) and extent < vec_lanes:
-            return False
-
-        # Lazy-register kernels for the current target (no-op if already
-        # registered, mirrors the pattern used in MetaSchedule's RISC-V rules).
-        try:
-            from tvm.s_tir.tensor_intrin.riscv_cpu import (
-                _rvv_reduce_kernel_name,
-                register_riscv_intrinsics,
-            )
-        except ImportError:
-            return False
-        try:
-            register_riscv_intrinsics(target)
-        except Exception:  # pylint: disable=broad-except
-            return False
-
-        # Resolve element dtype from the block's write buffer.
-        block_stmt = sch.get(block_rv)
-        if not block_stmt.writes:
-            return False
-        dtype_obj = DataType(block_stmt.writes[0].buffer.dtype)
-        # Only FP supported by vfredmax/vfredusum.
-        if not str(dtype_obj).startswith("float"):
-            return False
-        # Require the schedule's vec_lanes to match the registered chunk size
-        # for this dtype (n_elems = VLEN/SEW under LMUL=1).
-        if dtype_obj.bits != dtype_bits:
-            return False
-
-        intrin_name = _rvv_reduce_kernel_name(vec_lanes, str(dtype_obj), op)
-        if s_tir.TensorIntrin.get(intrin_name, allow_missing=True) is None:
-            return False
-
-        # Split inner axis into [outer, vec_lanes-chunk] then tensorize the chunk.
-        try:
-            _, vec_loop = sch.split(inner, factors=[None, vec_lanes])
-            sch.tensorize(vec_loop, intrin_name)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.debug("RVV reduction tensorize failed for %s: %s", intrin_name, exc)
-            return False
-        return True
-
-    @staticmethod
-    def _unroll_reduction_inner(sch, block_rv, vec_lanes):
-        """Split the reduction inner loop and annotate for unrolling."""
         block_loops = sch.get_loops(block_rv)
         if len(block_loops) <= 1:
             return
         inner = block_loops[-1]
         extent = get_extent(sch, inner)
         if isinstance(extent, int) and extent <= vec_lanes:
+            # Whole reduction fits in one vector; nothing to chunk.
             return
-        _, inner_loop = sch.split(inner, factors=[None, vec_lanes])
-        sch.annotate(inner_loop, ann_key="pragma_auto_unroll_max_step", ann_val=vec_lanes)
-        sch.annotate(inner_loop, ann_key="pragma_unroll_explicit", ann_val=1)
+
+        _, vec_loop = sch.split(inner, factors=[None, vec_lanes])
+
+        intrin_name = (
+            Reduction._resolve_rvv_reduction_intrin(
+                sch, block_rv, vec_lanes, dtype_bits, target
+            )
+            if rvv_ok
+            else None
+        )
+
+        if intrin_name is not None:
+            try:
+                sch.tensorize(vec_loop, intrin_name)
+                return
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug(
+                    "RVV reduction tensorize failed for %s: %s; falling back to unroll",
+                    intrin_name,
+                    exc,
+                )
+                # Fall through to annotation path on the same vec_loop.
+
+        sch.annotate(vec_loop, ann_key="pragma_auto_unroll_max_step", ann_val=vec_lanes)
+        sch.annotate(vec_loop, ann_key="pragma_unroll_explicit", ann_val=1)
+
+    @staticmethod
+    def _resolve_rvv_reduction_intrin(sch, block_rv, vec_lanes, dtype_bits, target):
+        """Return a registered RVV reduction intrinsic name for this block, or None.
+
+        Returns None if any precondition fails — non-FP dtype, dtype-bits
+        mismatch with the schedule's chunk size, unrecognised reduction
+        op, intrinsic registration failure, or kernel-not-found.
+        """
+        op = _detect_reduction_op(sch, block_rv)
+        if op not in ("max", "sum"):
+            return None
+
+        block_stmt = sch.get(block_rv)
+        if not block_stmt.writes:
+            return None
+        dtype_obj = DataType(block_stmt.writes[0].buffer.dtype)
+        if not str(dtype_obj).startswith("float"):
+            return None
+        # Require the schedule's vec_lanes to match the registered chunk size
+        # for this dtype (n_elems = VLEN/SEW under LMUL=1).
+        if dtype_obj.bits != dtype_bits:
+            return None
+
+        try:
+            from tvm.s_tir.tensor_intrin.riscv_cpu import (
+                _rvv_reduce_kernel_name,
+                register_riscv_intrinsics,
+            )
+        except ImportError:
+            return None
+        try:
+            register_riscv_intrinsics(target)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+        intrin_name = _rvv_reduce_kernel_name(vec_lanes, str(dtype_obj), op)
+        if s_tir.TensorIntrin.get(intrin_name, allow_missing=True) is None:
+            return None
+        return intrin_name
